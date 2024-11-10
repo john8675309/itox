@@ -1,0 +1,400 @@
+import 'dart:convert';
+import 'dart:ffi';
+import 'dart:typed_data';
+import 'package:flutter/material.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'libtox_bindings.dart';
+
+void main() {
+  runApp(const ToxApp());
+}
+
+class Friend {
+  final String toxId;
+  final int friendNumber; // Assigned by Tox
+  final String alias;
+  String status;
+
+  Friend({
+    required this.toxId,
+    required this.friendNumber,
+    required this.alias,
+    this.status = 'Offline',
+  });
+
+  // Convert Friend to JSON
+  Map<String, dynamic> toJson() {
+    return {
+      'toxId': toxId,
+      'friendNumber': friendNumber,
+      'alias': alias,
+      'status': status,
+    };
+  }
+
+  // Create Friend from JSON
+  factory Friend.fromJson(Map<String, dynamic> json) {
+    return Friend(
+      toxId: json['toxId'],
+      friendNumber: json['friendNumber'],
+      alias: json['alias'],
+      status: json['status'],
+    );
+  }
+
+  @override
+  String toString() {
+    return 'Friend Number: $friendNumber, Alias: $alias, Status: $status, ToxID: $toxId';
+  }
+}
+
+class ToxApp extends StatelessWidget {
+  const ToxApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'Tox Messenger',
+      theme: ThemeData(primarySwatch: Colors.blue),
+      home: const ToxHomePage(),
+    );
+  }
+}
+
+class ToxHomePage extends StatefulWidget {
+  const ToxHomePage({super.key});
+
+  @override
+  _ToxHomePageState createState() => _ToxHomePageState();
+}
+
+class _ToxHomePageState extends State<ToxHomePage> {
+  late Pointer<Tox> toxInstance;
+  String? myToxID;
+  int _currentPage = 0; // For bottom navigation
+  final friendIdController = TextEditingController();
+  final messageController = TextEditingController();
+  Map<int, Friend> friends = {}; // Friend number -> Friend status
+
+  @override
+  void initState() {
+    super.initState();
+    initTox();
+  }
+
+  Future<void> initTox() async {
+    final prefs = await SharedPreferences.getInstance();
+    try {
+      //await prefs.remove('friends');
+      for (final entry in friends.entries) {
+        print('Friend Number: ${entry.key}, Info: ${entry.value}');
+      }
+      print('Initializing Tox...');
+      toxInstance = await createToxInstance();
+      print('Tox instance initialized: $toxInstance');
+
+      myToxID = getToxID(toxInstance);
+      //prefs.setString('myToxID', myToxID!);
+      print('Your Tox ID: $myToxID');
+      final publicKey = getPublicKey(toxInstance);
+      print('Public Key (Base64): ${base64Encode(publicKey)}');
+      bootstrapToxNetwork(toxInstance);
+      registerMessageCallback(toxInstance);
+      loadFriends(prefs);
+
+      //runToxEventLoop(toxInstance, updateStatuses);
+      runToxEventLoop(toxInstance, updateStatuses);
+      setStatusOnline(toxInstance);
+      printFriendList(toxInstance);
+      //updateStatuses();
+    } catch (e) {
+      print('Error initializing Tox: $e');
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Failed to initialize Tox: $e')),
+      );
+    }
+  }
+
+  void updateStatuses() {
+    setState(() {
+      for (final entry in friends.entries) {
+        final friendNumber = entry.key;
+        final friend = entry.value;
+        //if (entry.key != 0) {
+        // Use the safe wrapper to get the connection status
+        final status = getConnectionStatus(toxInstance, friendNumber);
+        friend.status = status;
+        //}
+      }
+    });
+  }
+
+  bool friendExists(Pointer<Tox> tox, int friendNumber) {
+    final result = toxFriendExists(tox, friendNumber);
+    print("Exis??? ${result}");
+    return result == 1; // 1 means the friend exists
+  }
+
+  void loadFriends(SharedPreferences prefs) {
+    final savedFriendsJson = prefs.getString('friends');
+    if (savedFriendsJson != null) {
+      final savedFriendsList = jsonDecode(savedFriendsJson) as List;
+
+      for (var json in savedFriendsList) {
+        final friend = Friend.fromJson(json);
+
+        // Add friend to memory
+        friends[friend.friendNumber] = friend;
+
+        // Debugging
+        print('Loaded Friend: ${friend.toJson()}');
+
+        // Extract public key (Tox ID) from friend and convert to Uint8List
+        final publicKey = Uint8List(32);
+        for (int i = 0; i < 32; i++) {
+          publicKey[i] = int.parse(
+            friend.toxId.substring(i * 2, i * 2 + 2), // Hexadecimal parsing
+            radix: 16,
+          );
+        }
+
+        // Use the public key to find the friend number
+
+        // Check if friend exists in Tox
+        final exists = toxFriendExists(toxInstance, friend.friendNumber);
+        if (exists == 0) {
+          // Friend not present in Tox, re-add using the ToxID
+          try {
+            final result = addFriend(toxInstance, friend.toxId, 'Reconnecting');
+            print('Re-added friend with number: $result');
+          } catch (e) {
+            print('Error re-adding friend ${friend.toxId}: $e');
+          }
+        }
+        try {
+          final friendNumber = findFriendNumber(toxInstance, publicKey);
+          print('Friend number for ${friend.toxId}: $friendNumber');
+        } catch (e) {
+          print('Error finding friend by public key: $e');
+        }
+        updateStatuses();
+      }
+
+      print('Friends Loaded: $friends');
+      printFriendList(toxInstance);
+      setState(() {});
+    }
+  }
+
+  Future<void> saveFriends() async {
+    final prefs = await SharedPreferences.getInstance();
+
+    // Convert friends to JSON
+    final friendList = friends.values.map((friend) => friend.toJson()).toList();
+
+    // Save the JSON string
+    await prefs.setString('friends', jsonEncode(friendList));
+  }
+
+  void addNewChat() {
+    // Logic to compose a new chat
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Compose New Chat!')),
+    );
+  }
+
+  void switchPage(int index) {
+    setState(() {
+      _currentPage = index;
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Tox Messenger'),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.create),
+            tooltip: 'Compose New',
+            onPressed: addNewChat,
+          ),
+        ],
+      ),
+      body: IndexedStack(
+        index: _currentPage,
+        children: [
+          buildChatsPage(),
+          buildAddFriendPage(),
+          buildSettingsPage(),
+        ],
+      ),
+      bottomNavigationBar: BottomNavigationBar(
+        currentIndex: _currentPage,
+        onTap: switchPage,
+        items: const [
+          BottomNavigationBarItem(
+            icon: Icon(Icons.chat),
+            label: 'Chats',
+          ),
+          BottomNavigationBarItem(
+            icon: Icon(Icons.person_add),
+            label: 'Add Friend',
+          ),
+          BottomNavigationBarItem(
+            icon: Icon(Icons.settings),
+            label: 'Settings',
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget buildAddFriendPage() {
+    return Padding(
+      padding: const EdgeInsets.all(16.0),
+      child: Column(
+        children: [
+          TextField(
+            controller: friendIdController,
+            decoration: const InputDecoration(labelText: 'Friend ID'),
+          ),
+          const SizedBox(height: 16),
+          ElevatedButton(
+            onPressed: addToxFriend,
+            child: const Text('Add Friend'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget buildChatsPage() {
+    return Column(
+      children: [
+        if (myToxID != null)
+          Padding(
+            padding: const EdgeInsets.all(8.0),
+            child: Text('Your Tox ID: $myToxID'),
+          ),
+        Expanded(
+          child: ListView(
+            children: friends.entries
+                .map(
+                  (entry) => ListTile(
+                    title: Text('Friend ${entry.key}'),
+                    subtitle: Text('Status: ${entry.value}'),
+                    onTap: () {
+                      // Select a friend for chat
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        SnackBar(content: Text('Selected Friend ${entry.key}')),
+                      );
+                    },
+                  ),
+                )
+                .toList(),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget buildSettingsPage() {
+    return Padding(
+      padding: const EdgeInsets.all(16.0),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text(
+            'Settings',
+            style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold),
+          ),
+          const SizedBox(height: 16),
+          ElevatedButton(
+            onPressed: nukeKeys,
+            style: ElevatedButton.styleFrom(
+              backgroundColor: Colors.red,
+            ),
+            child: const Text('Nuke Keys'),
+          ),
+          const SizedBox(height: 8),
+          const Text(
+            'This will permanently delete your private key and reset the app. You will lose all your data.',
+            style: TextStyle(color: Colors.red),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> nukeKeys() async {
+    final prefs = await SharedPreferences.getInstance();
+
+    // Remove the private key (this also invalidates the ToxID)
+    print('Removing private key...');
+    await prefs.remove('privateKey');
+
+    // Remove saved friends
+    print('Removing saved friends...');
+    await prefs.remove('friends');
+
+    // Reset in-memory data
+    setState(() {
+      friends.clear();
+      myToxID = null;
+    });
+
+    // Inform the user
+    print('All Tox data has been nuked.');
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('All Tox data has been nuked.')),
+    );
+  }
+
+  void addToxFriend() {
+    final friendId = friendIdController.text.trim();
+    const friendMessage = "Hello from Tox!";
+
+    if (friendId.length != 76 ||
+        !RegExp(r'^[0-9a-fA-F]{76}$').hasMatch(friendId)) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+            content: Text(
+                'Invalid Tox ID. Please enter a valid 76-character hexadecimal string.')),
+      );
+      return;
+    }
+
+    try {
+      final result = addFriend(toxInstance, friendId, friendMessage);
+      if (result >= 0) {
+        final newFriend = Friend(
+          toxId: friendId,
+          friendNumber: result,
+          alias: '', // You can let users customize this later
+          status: 'Pending',
+        );
+
+        // Add to the local map
+        friends[result] = newFriend;
+
+        // Save the updated friends list
+        saveFriends();
+
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Friend added successfully!')),
+        );
+      } else {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Failed to add friend')),
+        );
+      }
+    } catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Error adding friend: $e')),
+      );
+      print('Error adding friend: $e');
+    }
+  }
+}
